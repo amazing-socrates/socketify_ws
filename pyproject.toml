@@ -1,0 +1,19 @@
+[project]
+name = "socketify-ws"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "zyuvszqk",email = "zyuvszqk@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "socketify (>=0.0.31,<0.0.32)",
+    "azure-cognitiveservices-speech (>=1.42.0,<2.0.0)",
+    "python-dotenv (>=1.0.1,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
