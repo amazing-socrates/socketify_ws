@@ -1,1 +1,1 @@
-poetry run python app.py
+poetry run dev

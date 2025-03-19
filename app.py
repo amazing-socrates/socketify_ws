@@ -52,45 +52,54 @@ recognizer = speechsdk.translation.TranslationRecognizer(
     auto_detect_source_language_config=auto_detect_config,
 )
 
-# Queue for recognition results
-result_queue = Queue()
+# Queue for recognition results with size limit
+result_queue = Queue(maxsize=100)
 
 # 用字典存储每个房间的 WebSocket 连接
 room_connections = {}
+# connections_lock = threading.Lock()
 
-# 共享的会话信息（线程安全的字典）
-session_info = {
-    "AppId": "Default_AppId",
-    "RoomId": "Default_RoomId",
-    "From": "default_user",
-    "Binary": False
-}
+# # 用于节流的全局变量
+# last_recognizing_time = 0
+# throttle_interval = 0.5  # 每 0.5 秒最多处理一次 recognizing 事件
 
 # Event handlers for speech recognition
-def handle_recognizing(args):
+def handle_recognizing(args, session_info):
+    # global last_recognizing_time
+    # current_time = time.time()
+    # if current_time - last_recognizing_time < throttle_interval:
+    #     return
+    # last_recognizing_time = current_time
+
     try:
         translations = {lang: text for lang, text in args.result.translations.items()}
         result = {
-            **session_info,  # 使用当前的 session_info
+            **session_info,
             "status": "recognizing",
             "translations": translations,
             "Message": translations.get("zh-Hans", "")
         }
-        result_queue.put(result)
+        if not result_queue.full():
+            result_queue.put(result)
+        else:
+            print("Result queue full, dropping result")
     except Exception as e:
         print(f"Error in handle_recognizing: {e}")
 
-def handle_recognized(args):
+def handle_recognized(args, session_info):
     try:
         if hasattr(args.result, 'translations'):
             translations = {lang: text for lang, text in args.result.translations.items()}
             result = {
-                **session_info,  # 使用当前的 session_info
+                **session_info,
                 "status": "recognized",
                 "translations": translations,
                 "Message": translations.get("zh-Hans", "")
             }
-            result_queue.put(result)
+            if not result_queue.full():
+                result_queue.put(result)
+            else:
+                print("Result queue full, dropping result")
     except Exception as e:
         print(f"Error in handle_recognized: {e}")
 
@@ -101,66 +110,79 @@ def handle_canceled(evt):
     print(f"Speech recognition canceled: {evt}")
 
 # Background thread to send recognition results
+# def send_results():
+#          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+#         while True:
+#             if not result_queue.empty():
+#                 result = result_queue.get()
+#                 room_id = result.get("RoomId")
+#                 message = json.dumps(result)
+#                 if room_id in room_connections:
+#                     ws_list = list(room_connections[room_id])
+#                     futures = [executor.submit(ws.send, message, OpCode.TEXT) for ws in ws_list]
+#                     for future in futures:
+#                         future.result()
+#             time.sleep(0.1)
+
 def send_results():
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        while True:
-            if not result_queue.empty():
-                result = result_queue.get()
-                room_id = result.get("RoomId")
-                message = json.dumps(result)
-                if room_id in room_connections:
-                    ws_list = list(room_connections[room_id])
-                    # 检查 WebSocket 状态并发送
-                    futures = []
-                    for ws in ws_list:
-                        if ws.ws and not ws.ws.closed:  # 确保连接有效
-                            futures.append(executor.submit(ws.send, message, OpCode.TEXT))
-                        else:
-                            room_connections[room_id].discard(ws)  # 移除无效连接
-                    # 等待发送完成
-                    for future in futures:
-                        try:
-                            future.result(timeout=1)  # 设置超时，避免阻塞
-                        except Exception as e:
-                            print(f"Send error: {e}")
-            time.sleep(0.05)  # 降低循环频率，减少负载
+    while True:
+        if not result_queue.empty():
+            result = result_queue.get()
+            room_id = result.get("RoomId")
+            message = json.dumps(result)
+            if room_id in room_connections:
+                ws_list = list(room_connections[room_id])
+                for ws in ws_list:
+                    try:
+                        ws.send(json.dumps(result), OpCode.TEXT)
+                    except Exception as e:
+                        print(f"Error sending message to WebSocket: {e}")
+        time.sleep(0.1)
+
 
 # Start the background thread
 threading.Thread(target=send_results, daemon=True).start()
 
+
 # WebSocket event handlers
 def ws_open(ws):
     print("WebSocket connected, starting recognition...")
-    # 只在连接建立时绑定事件处理器
-    recognizer.recognizing.connect(handle_recognizing)
-    recognizer.recognized.connect(handle_recognized)
-    recognizer.session_stopped.connect(handle_session_stopped)
-    recognizer.canceled.connect(handle_canceled)
-    recognizer.start_continuous_recognition_async().get()
+
 
 def ws_message(ws, message, opcode):
     if opcode == OpCode.BINARY:
         try:
-            # 解析消息：前4字节为JSON长度
+
+            # 共享的会话信息
+            session_info = {
+                "AppId": "Default_AppId",
+                "RoomId": "Default_RoomId",
+                "From": "default_user",
+                "Binary": False
+            }
+
             json_length = int.from_bytes(message[:4], byteorder='big')
             json_data = message[4:4+json_length].decode('utf-8')
             audio_data = message[4+json_length:]
 
-            # 更新全局 session_info
             new_session_info = json.loads(json_data)
             session_info.update(new_session_info)
             room_id = session_info.get("RoomId")
 
-            # 将 WebSocket 连接加入对应房间
             if room_id:
                 if room_id not in room_connections:
                     room_connections[room_id] = set()
                 room_connections[room_id].add(ws)
 
-            # 将音频数据写入流
+                # print("Session Info:", session_info)
+            # 动态绑定事件处理器，携带会话信息
+            recognizer.recognizing.disconnect_all()
+            recognizer.recognized.disconnect_all()
+            recognizer.recognizing.connect(lambda args: handle_recognizing(args, session_info))
+            recognizer.recognized.connect(lambda args: handle_recognized(args, session_info))
+
             if audio_data:
                 audio_stream.write(audio_data)
-
         except Exception as e:
             print(f"Error processing message: {e}")
     else:
@@ -169,9 +191,10 @@ def ws_message(ws, message, opcode):
 def ws_close(ws, code, message):
     print("WebSocket closed")
     for room_id in room_connections:
-        room_connections[room_id].discard(ws)
-    recognizer.stop_continuous_recognition_async().get()
-    audio_stream.close()
+        if room_id in room_connections:
+            room_connections[room_id].discard(ws)
+    # recognizer.stop_continuous_recognition_async().get()
+    # audio_stream.close()
 
 # Define WebSocket route
 app.ws("/translate-stream", {
