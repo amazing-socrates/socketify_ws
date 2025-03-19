@@ -46,31 +46,23 @@ recognizer = speechsdk.translation.TranslationRecognizer(
 recognizer.canceled.connect(lambda evt: print(f"Speech recognition canceled: {evt.reason}, details: {evt}"))
 recognizer.session_stopped.connect(lambda evt: print("Session stopped"))
 
-result_queue = Queue(maxsize=100)
-room_connections = {}
-connections_lock = threading.Lock()
-
+result_queue = Queue(maxsize=10000)
+ws_connections = set()
 def send_results():
     while True:
-        result = result_queue.get()  # 阻塞等待结果
-        print(f"Sending result: {result}")
-        room_id = result.get("RoomId")
-        message = json.dumps(result)
-        with connections_lock:
-            if room_id in room_connections:
-                ws_list = list(room_connections[room_id])
-                for ws in ws_list:
-                    try:
-                        ws.send(message, OpCode.TEXT)
-                    except Exception as e:
-                        print(f"Error sending message to WebSocket: {e}")
-                        room_connections[room_id].discard(ws)
+        for ws in list(ws_connections):
+            if not result_queue.empty():
+                result = result_queue.get()
+                message = json.dumps(result)
+                ws.send(message, OpCode.TEXT)
+        time.sleep(0.1)
 
 threading.Thread(target=send_results, daemon=True).start()
 
 def ws_open(ws):
     print("WebSocket connected, starting recognition...")
     recognizer.start_continuous_recognition_async()
+    ws_connections.add(ws)
 
 def ws_message(ws, message, opcode):
     if opcode == OpCode.BINARY:
@@ -84,14 +76,7 @@ def ws_message(ws, message, opcode):
             session = ws.session
 
             session.update_session_info(json_data)
-            room_id = session.session_info.get("RoomId")
-
-            if room_id:
-                with connections_lock:
-                    if room_id not in room_connections:
-                        room_connections[room_id] = set()
-                    room_connections[room_id].add(ws)
-
+ 
             session.bind_handlers()
             if audio_data:
                 audio_stream.write(audio_data)
@@ -102,14 +87,9 @@ def ws_message(ws, message, opcode):
 
 def ws_close(ws, code, message):
     print("WebSocket closed")
-    with connections_lock:
-        for room_id in list(room_connections.keys()):
-            if room_id in room_connections:
-                room_connections[room_id].discard(ws)
-                if not room_connections[room_id]:
-                    del room_connections[room_id]
+    ws_connections.remove(ws)
     recognizer.stop_continuous_recognition_async().get()
-
+    audio_stream.close()
 app.ws("/translate-stream", {
     "open": ws_open,
     "message": ws_message,
