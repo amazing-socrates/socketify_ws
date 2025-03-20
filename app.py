@@ -8,6 +8,7 @@ import time
 from dotenv import load_dotenv
 import os
 from speech_session import SpeechSession
+import concurrent.futures
 
 app = App()
 load_dotenv()
@@ -50,12 +51,22 @@ result_queue = Queue(maxsize=10000)
 ws_connections = set()
 def send_results():
     while True:
-        for ws in list(ws_connections):
-            if not result_queue.empty():
-                result = result_queue.get()
-                message = json.dumps(result)
-                ws.send(message, OpCode.TEXT)
-        time.sleep(0.1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+            futures = []
+            for ws in list(ws_connections):
+                if not result_queue.empty():
+                    result = result_queue.get()
+                    message = json.dumps(result)
+
+                    #ws.send(message, OpCode.TEXT)
+                    futures.append(executor.submit(ws.send, message, OpCode.TEXT))
+            # 等待发送完成
+            for future in futures:
+                try:
+                    future.result(timeout=1)  # 设置超时，避免阻塞
+                except Exception as e:
+                    print(f"Send error: {e}")
+            time.sleep(0.1)
 
 threading.Thread(target=send_results, daemon=True).start()
 
