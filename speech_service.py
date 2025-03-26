@@ -1,8 +1,9 @@
 import os
+import numpy as np
 from dotenv import load_dotenv
 import azure.cognitiveservices.speech as speechsdk
 from azure.cognitiveservices.speech.audio import PushAudioInputStream, AudioConfig
-
+from silero_vad import load_silero_vad, get_speech_timestamps
 
 class SpeechService:
     def __init__(self):
@@ -55,10 +56,30 @@ class SpeechService:
             )
         )
         self.recognizer.session_stopped.connect(lambda evt: print("Session stopped"))
+        
+        # 加载 Silero VAD 模型（全局只加载一次）
+        self.vad_model = load_silero_vad()
+        # 新增一个缓存，用来拼接短时音频数据
+        self.audio_buffer = bytearray()
 
     def write_audio(self, data: bytes):
-        """将音频数据写入音频流"""
-        self.audio_stream.write(data)
+        """缓存约0.3秒的音频数据后，再进行 VAD 检测，检测到语音则写入音频流"""
+        # 将接收到的音频数据追加到缓存中
+        self.audio_buffer.extend(data)
+        # 对于 16kHz、16位单声道，每秒采样数为16000，每个采样2字节，0.3秒对应 0.3*16000*2 = 9600 字节
+        THRESHOLD_BYTES = 9600
+        if len(self.audio_buffer) >= THRESHOLD_BYTES:
+            # 拼接缓存数据并清空缓存
+            buffer_data = bytes(self.audio_buffer)
+            self.audio_buffer = bytearray()
+            # 将二进制数据转换为 numpy 数组，格式为 int16
+            audio_np = np.frombuffer(buffer_data, dtype=np.int16)
+            # 使用 VAD 检测语音时间戳（单位秒）
+            speech_timestamps = get_speech_timestamps(audio_np, self.vad_model, return_seconds=True)
+            if speech_timestamps:
+                self.audio_stream.write(buffer_data)
+            else:
+                print("VAD过滤：未检测到语音，丢弃缓存音频数据")
 
     def start_recognition_async(self):
         """启动连续语音识别（异步）"""
